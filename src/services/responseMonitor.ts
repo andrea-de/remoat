@@ -48,7 +48,6 @@ export const RESPONSE_SELECTORS = {
         const isInsideExcludedContainer = (node) => {
             if (node.closest('details')) return true;
             if (node.closest('[class*="feedback"], footer')) return true;
-            if (node.closest('.notify-user-container')) return true;
             if (node.closest('[role="dialog"]')) return true;
             return false;
         };
@@ -219,7 +218,6 @@ export const RESPONSE_SELECTORS = {
         const isInsideExcludedContainer = (node) => {
             if (node.closest('details')) return true;
             if (node.closest('[class*="feedback"], footer')) return true;
-            if (node.closest('.notify-user-container')) return true;
             if (node.closest('[role="dialog"]')) return true;
             return false;
         };
@@ -313,7 +311,6 @@ export const RESPONSE_SELECTORS = {
         const isInsideExcludedContainer = (node) => {
             if (node.closest('details')) return true;
             if (node.closest('[class*="feedback"], footer')) return true;
-            if (node.closest('.notify-user-container')) return true;
             if (node.closest('[role="dialog"]')) return true;
             return false;
         };
@@ -439,6 +436,23 @@ export const RESPONSE_SELECTORS = {
             }
         }
 
+        // --- Approval Required ---
+        let approvalActive = false;
+        let approvalDescription = '';
+        const ALLOW_ONCE_PAT = ['allow once', 'allow one time', '今回のみ許可', '1回のみ許可', '一度許可'];
+        const ALLOW_PAT = ['allow', 'permit', 'run', 'execute', '許可', '承認', '確認', '実行'];
+        const visibleBtns = Array.from(document.querySelectorAll('button')).filter(btn => btn.offsetParent !== null);
+        const approveBtn = visibleBtns.find(btn => {
+            const t = (btn.textContent || '').toLowerCase();
+            return ALLOW_ONCE_PAT.some(p => t.includes(p)) || ALLOW_PAT.some(p => t.includes(p));
+        });
+        if (approveBtn) {
+            approvalActive = true;
+            const container = approveBtn.closest('.notify-user-container, [role="dialog"], .modal, .approval-container');
+            const descEl = container ? container.querySelector('p, .description') : null;
+            if (descEl) approvalDescription = (descEl.textContent || '').trim();
+        }
+
         // --- Legacy text extraction ---
         const selectors = [
             { sel: '.rendered-markdown', score: 10 },
@@ -469,7 +483,6 @@ export const RESPONSE_SELECTORS = {
         const isInsideExcludedContainer = (node) => {
             if (node.closest('details')) return true;
             if (node.closest('[class*="feedback"], footer')) return true;
-            if (node.closest('.notify-user-container')) return true;
             if (node.closest('[role="dialog"]')) return true;
             return false;
         };
@@ -531,7 +544,7 @@ export const RESPONSE_SELECTORS = {
             }
         }
 
-        return { isGenerating, quotaError, planningActive, responseText, processLogs };
+        return { isGenerating, quotaError, planningActive, approvalActive, approvalDescription, responseText, processLogs };
     })()`,
     /** Quota error detection — text-based h3 span match first, class-based fallback second */
     QUOTA_ERROR: `(() => {
@@ -1007,6 +1020,8 @@ export class ResponseMonitor {
             let isGenerating: boolean;
             let quotaDetected: boolean;
             let planningActive: boolean;
+            let approvalActive: boolean;
+            let approvalDescription: string = '';
             let currentText: string | null = null;
             let structuredHandledLogs = false;
 
@@ -1021,6 +1036,8 @@ export class ResponseMonitor {
                 isGenerating = !!combined.isGenerating;
                 quotaDetected = !!combined.quotaError;
                 planningActive = !!combined.planningActive;
+                approvalActive = !!combined.approvalActive;
+                approvalDescription = combined.approvalDescription || '';
 
                 // Try structured extraction first
                 if (structuredResult) {
@@ -1070,6 +1087,11 @@ export class ResponseMonitor {
                 if (!structuredHandledLogs && Array.isArray(combined.processLogs)) {
                     this.emitNewProcessLogs(combined.processLogs);
                 }
+
+                // Include approval description in process logs if not already there
+                if (approvalActive && approvalDescription) {
+                    this.emitNewProcessLogs([approvalDescription]);
+                }
             } else {
                 // Legacy mode: single combined CDP call gets everything
                 const combinedResult = await this.cdpService.call(
@@ -1080,11 +1102,17 @@ export class ResponseMonitor {
                 isGenerating = !!combined.isGenerating;
                 quotaDetected = !!combined.quotaError;
                 planningActive = !!combined.planningActive;
+                approvalActive = !!combined.approvalActive;
+                approvalDescription = combined.approvalDescription || '';
                 currentText = typeof combined.responseText === 'string' ? combined.responseText.trim() || null : null;
                 this.lastExtractionSource = 'legacy';
 
                 if (Array.isArray(combined.processLogs)) {
                     this.emitNewProcessLogs(combined.processLogs);
+                }
+
+                if (approvalActive && approvalDescription) {
+                    this.emitNewProcessLogs([approvalDescription]);
                 }
             }
 
@@ -1098,6 +1126,13 @@ export class ResponseMonitor {
                     this.setPhase('thinking', null);
                 }
                 this.stopGoneCount = 0;
+            }
+
+            // Handle waiting phase (approval required)
+            // If we are "generating" but also have an approval request, switch to waiting
+            // to stop the thinking timer in the bot UI.
+            if (approvalActive) {
+                this.setPhase('waiting', this.lastText);
             }
 
             // Handle quota detection

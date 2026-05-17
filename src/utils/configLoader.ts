@@ -19,6 +19,7 @@ export interface PersistedConfig {
     logLevel?: LogLevel;
     extractionMode?: 'legacy' | 'structured';
     useTopics?: boolean;
+    maxOpenProjects?: number;
 }
 
 function getConfigDir(): string {
@@ -94,6 +95,11 @@ function mergeConfig(persisted: PersistedConfig): AppConfig {
         logLevel,
         extractionMode,
         useTopics,
+        maxOpenProjects: resolveInt(
+            process.env.MAX_OPEN_PROJECTS,
+            persisted.maxOpenProjects,
+            3,
+        ),
     };
 }
 
@@ -139,6 +145,19 @@ function resolveBoolean(
     defaultValue: boolean,
 ): boolean {
     if (envValue !== undefined) return envValue.toLowerCase() === 'true';
+    if (persistedValue !== undefined) return persistedValue;
+    return defaultValue;
+}
+
+function resolveInt(
+    envValue: string | undefined,
+    persistedValue: number | undefined,
+    defaultValue: number,
+): number {
+    if (envValue !== undefined) {
+        const parsed = parseInt(envValue, 10);
+        if (!isNaN(parsed)) return parsed;
+    }
     if (persistedValue !== undefined) return persistedValue;
     return defaultValue;
 }

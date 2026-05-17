@@ -11,6 +11,7 @@ export interface AppConfig {
     logLevel: LogLevel;
     extractionMode: ExtractionMode;
     useTopics: boolean;
+    maxOpenProjects: number;
 }
 
 export type ResponseDeliveryMode = 'stream';

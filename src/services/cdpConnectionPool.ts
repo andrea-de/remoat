@@ -1,4 +1,6 @@
 import { EventEmitter } from 'events';
+import * as http from 'http';
+import { CDP_PORTS } from '../utils/cdpPorts';
 
 import { logger } from '../utils/logger';
 import { extractProjectNameFromPath } from '../utils/pathUtils';
@@ -27,11 +29,106 @@ export class CdpConnectionPool extends EventEmitter {
     private readonly planningDetectors = new Map<string, PlanningDetector>();
     private readonly userMessageDetectors = new Map<string, UserMessageDetector>();
     private readonly connectingPromises = new Map<string, Promise<CdpService>>();
+    private readonly lastUsed = new Map<string, number>();
     private readonly cdpOptions: CdpServiceOptions;
+    private maxConnections: number = 3;
 
-    constructor(cdpOptions: CdpServiceOptions = {}) {
+    constructor(maxConnections: number = 3, cdpOptions: CdpServiceOptions = {}) {
         super();
+        this.maxConnections = maxConnections;
         this.cdpOptions = cdpOptions;
+    }
+
+    /**
+     * Update the max number of allowed connections.
+     */
+    setMaxConnections(max: number): void {
+        this.maxConnections = max;
+    }
+
+    /**
+     * Get the current max number of allowed connections.
+     */
+    getMaxConnections(): number {
+        return this.maxConnections;
+    }
+
+    /**
+     * Aggressively close any Antigravity window/target that does not belong to the active project.
+     * This helps prevent resource exhaustion on limited VPS hardware.
+     */
+    async cleanupExtraTargets(activeProjectName?: string): Promise<void> {
+        logger.debug(`[CdpConnectionPool] Starting aggressive target cleanup (activeProject="${activeProjectName || 'none'}")...`);
+        const ports = this.cdpOptions.portsToScan || [...CDP_PORTS];
+        
+        for (const port of ports) {
+            try {
+                const list = await this.getJson(`http://127.0.0.1:${port}/json/list`);
+                const targetsToClose = list.filter((t: any) => {
+                    if (t.type !== 'page' || !t.webSocketDebuggerUrl) return false;
+                    
+                    // Always ignore Launchpad and internal agents
+                    if (t.title?.includes('Launchpad') || t.url?.includes('workbench-jetski-agent')) return false;
+                    
+                    // If it's a workbench (or looks like a window loading)
+                    if (t.url?.includes('workbench') || t.title === '' || t.title === 'Antigravity' || t.title === 'Cascade') {
+                        if (!activeProjectName) return true; // Close all if no active project
+                        
+                        // If it has a title, check if it matches the active project
+                        if (t.title && t.title !== 'Antigravity' && t.title !== 'Cascade') {
+                            return !t.title.toLowerCase().includes(activeProjectName.toLowerCase());
+                        }
+                        
+                        // If it has NO title yet (loading), and we already have an active connection elsewhere,
+                        // it's likely a zombie or a duplicate window.
+                        return true;
+                    }
+                    
+                    return false;
+                });
+
+                for (const target of targetsToClose) {
+                    logger.info(`[CdpConnectionPool] Auto-closing unauthorized target on port ${port}: "${target.title || '(no title)'}" (id=${target.id})`);
+                    await this.closeTargetById(port, target.id).catch(() => {});
+                }
+            } catch {
+                // Port not responding, skip
+            }
+        }
+    }
+
+    private async getJson(url: string): Promise<any[]> {
+        return new Promise((resolve, reject) => {
+            const req = http.get(url, (res) => {
+                if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
+                    res.resume();
+                    reject(new Error(`HTTP ${res.statusCode}`));
+                    return;
+                }
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+            });
+            req.on('error', reject);
+            req.setTimeout(3000, () => { req.destroy(); reject(new Error('Timeout')); });
+        });
+    }
+
+    private async closeTargetById(port: number, targetId: string): Promise<void> {
+        return new Promise((resolve, reject) => {
+            const req = http.request({
+                hostname: '127.0.0.1',
+                port: port,
+                path: `/json/close/${targetId}`,
+                method: 'PUT'
+            }, (res) => {
+                res.resume();
+                if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) resolve();
+                else reject(new Error(`Status ${res.statusCode}`));
+            });
+            req.on('error', reject);
+            req.end();
+        });
     }
 
     /**
@@ -52,6 +149,7 @@ export class CdpConnectionPool extends EventEmitter {
                 try {
                     // Re-validate that the still-open window is actually bound to this workspace.
                     await existing.discoverAndConnectForWorkspace(workspacePath);
+                    this.lastUsed.set(projectName, Date.now());
                     return existing;
                 } catch {
                     // Connection dropped during re-validation; close WebSocket and clean up
@@ -70,15 +168,57 @@ export class CdpConnectionPool extends EventEmitter {
             return pending;
         }
 
+        // PRE-CONNECTION CLEANUP:
+        // Before starting a new heavy Antigravity instance, ensure we are within limits
+        // and clean up any "ghost" windows that shouldn't be there.
+        try {
+            await this.cleanupExtraTargets().catch(() => {});
+            await this.enforceLimit(projectName);
+        } catch (err) {
+            logger.warn('[CdpConnectionPool] Pre-connection cleanup failed:', err);
+        }
+
         // Start a new connection
         const connectPromise = this.createAndConnect(workspacePath, projectName);
         this.connectingPromises.set(projectName, connectPromise);
 
         try {
             const cdp = await connectPromise;
+            this.lastUsed.set(projectName, Date.now());
             return cdp;
         } finally {
             this.connectingPromises.delete(projectName);
+        }
+    }
+
+    /**
+     * If the connection limit is reached, close the oldest (LRU) project.
+     * @param excludeProject Project to keep (usually the one just opened)
+     */
+    private enforceLimit(excludeProject: string): void {
+        const active = this.getActiveWorkspaceNames();
+        if (active.length <= this.maxConnections) return;
+
+        logger.info(`[CdpConnectionPool] Limit reached (${this.maxConnections}). Closing oldest project...`);
+
+        // Find oldest based on lastUsed
+        let oldestProject: string | null = null;
+        let oldestTime = Infinity;
+
+        for (const name of active) {
+            if (name === excludeProject) continue;
+            const time = this.lastUsed.get(name) || 0;
+            if (time < oldestTime) {
+                oldestTime = time;
+                oldestProject = name;
+            }
+        }
+
+        if (oldestProject) {
+            logger.info(`[CdpConnectionPool] Auto-closing LRU project: ${oldestProject}`);
+            this.closeBrowserWorkspace(oldestProject).catch((err) => {
+                logger.error(`[CdpConnectionPool] Failed to auto-close ${oldestProject}:`, err);
+            });
         }
     }
 
@@ -129,6 +269,8 @@ export class CdpConnectionPool extends EventEmitter {
             userMsgDetector.stop();
             this.userMessageDetectors.delete(projectName);
         }
+
+        this.lastUsed.delete(projectName);
     }
 
     /**
@@ -144,6 +286,8 @@ export class CdpConnectionPool extends EventEmitter {
             }
         }
         this.disconnectWorkspace(projectName);
+        // Clean up any remaining zombie targets for this project
+        await this.cleanupExtraTargets().catch(() => {});
     }
 
     /**

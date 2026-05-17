@@ -86,6 +86,7 @@ const PHASE_ICONS = {
     sending: '📡',
     thinking: '🧠',
     generating: '✍️',
+    waiting: '⏳',
     complete: '✅',
     timeout: '⏰',
     error: '❌',
@@ -94,6 +95,8 @@ const PHASE_ICONS = {
 const MAX_OUTBOUND_GENERATED_IMAGES = 4;
 const TELEGRAM_MSG_LIMIT = 4096;
 const MAX_INLINE_CHUNKS = 5;
+
+const CLOSE_PROJECT_PREFIX = 'close_proj:';
 
 /** Convert Telegram HTML back to readable Markdown for .md file attachment */
 function stripHtmlForFile(html: string): string {
@@ -506,8 +509,12 @@ async function sendPromptToAntigravity(
         }
 
         const startTime = Date.now();
-        const progressTitle = () => `${PHASE_ICONS.thinking} ${modelLabel}`;
-        const progressFooter = () => `⏱️ ${Math.round((Date.now() - startTime) / 1000)}s`;
+        let currentPhase: keyof typeof PHASE_ICONS = 'thinking';
+        const progressTitle = () => `${PHASE_ICONS[currentPhase] || PHASE_ICONS.thinking} ${modelLabel}`;
+        const progressFooter = () => {
+            if (currentPhase === 'waiting') return '🔔 Waiting for approval...';
+            return `⏱️ ${Math.round((Date.now() - startTime) / 1000)}s`;
+        };
 
         let lastProgressTrigger = 0;
         let progressTriggerTimeout: NodeJS.Timeout | null = null;
@@ -540,7 +547,11 @@ async function sendPromptToAntigravity(
             pollIntervalMs: 2000,
             maxDurationMs: 1800000,
             stopGoneConfirmCount: 3,
-            onPhaseChange: () => { },
+            onPhaseChange: (phase) => {
+                if (isFinalized) return;
+                currentPhase = (phase as keyof typeof PHASE_ICONS);
+                triggerProgressRefresh();
+            },
             onProcessLog: (logText) => {
                 if (isFinalized) return;
                 const trimmed = (logText || '').trim();
@@ -854,10 +865,10 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
     const workspaceService = new WorkspaceService(config.workspaceBaseDir);
 
     await ensureAntigravityRunning();
-
-    const bridge = initCdpBridge(config.autoApproveFileEdits);
+ 
+    const bridge = initCdpBridge(config.autoApproveFileEdits, config.maxOpenProjects);
     bridge.botToken = config.telegramBotToken;
-
+ 
     const chatSessionService = new ChatSessionService();
     const titleGenerator = new TitleGeneratorService();
     const promptDispatcher = new PromptDispatcher({
@@ -1022,6 +1033,8 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             `/template_delete — Delete a template\n\n` +
             `<b>🔧 System</b>\n` +
             `/status — Display overall bot status\n` +
+            `/max [number] — Set max open projects\n` +
+            `/system_kill — Force kill all Antigravity processes\n` +
             `/autoaccept — Toggle auto-approve mode\n` +
             `/cleanup [days] — Clean up inactive sessions\n` +
             `/ping — Check latency\n\n` +
@@ -1095,10 +1108,35 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         const currentMode = modeService.getCurrentMode();
         const autoAcceptStatus = bridge.autoAccept.isEnabled() ? '🟢 ON' : '⚪ OFF';
 
+        // Get system memory info
+        let memInfo = '';
+        try {
+            const os = require('os');
+            const free = os.freemem();
+            const total = os.totalmem();
+            const used = total - free;
+            const usedGb = (used / 1024 / 1024 / 1024).toFixed(1);
+            const totalGb = (total / 1024 / 1024 / 1024).toFixed(1);
+            memInfo = `\n<b>RAM:</b> ${usedGb}GB / ${totalGb}GB used`;
+        } catch {}
+
         let text = `<b>🔧 Bot Status</b>\n\n`;
         text += `<b>CDP:</b> ${activeNames.length > 0 ? `🟢 ${activeNames.length} project(s) connected` : '⚪ Disconnected'}\n`;
+        
+        // Show current port if connected
+        if (activeNames.length > 0) {
+            const cdp = bridge.pool.getConnected(activeNames[0]);
+            const targetUrl = cdp ? (cdp as any).targetUrl : null;
+            const portMatch = targetUrl?.match(/:(\d+)\//);
+            if (portMatch) {
+                text += `<b>Port:</b> <code>${portMatch[1]}</code>\n`;
+            }
+        }
+
         text += `<b>Mode:</b> ${escapeHtml(MODE_DISPLAY_NAMES[currentMode] || currentMode)}\n`;
+        text += `<b>Max Projects:</b> ${bridge.pool.getMaxConnections()}\n`;
         text += `<b>Auto Approve:</b> ${autoAcceptStatus}\n`;
+        text += memInfo + '\n';
 
         if (activeNames.length > 0) {
             text += `\n<b>Connected Projects:</b>\n`;
@@ -1112,6 +1150,43 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         }
 
         await replyHtml(ctx, text);
+    });
+
+    // /max command
+    bot.command('max', async (ctx) => {
+        const val = (ctx.match || '').trim();
+        if (!val) {
+            await replyHtml(ctx, `<b>🔧 Max Open Projects:</b> <code>${bridge.pool.getMaxConnections()}</code>\nUsage: /max [number]`);
+            return;
+        }
+
+        const num = parseInt(val, 10);
+        if (isNaN(num) || num < 1) {
+            await ctx.reply('⚠️ Please provide a valid number (1 or greater).');
+            return;
+        }
+
+        bridge.pool.setMaxConnections(num);
+        ConfigLoader.save({ maxOpenProjects: num });
+        await replyHtml(ctx, `✅ <b>Max Open Projects</b> set to: <code>${num}</code>`);
+    });
+
+    // /system_kill command
+    bot.command('system_kill', async (ctx) => {
+        await ctx.reply('🛑 Force-killing all Antigravity processes...');
+        try {
+            const { exec } = require('child_process');
+            exec('pkill -f antigravity', async (err: any) => {
+                if (err && err.code !== 1) {
+                    await ctx.reply(`❌ Error: ${err.message}`);
+                } else {
+                    bridge.pool.disconnectAll();
+                    await ctx.reply('✅ All Antigravity processes terminated. Use /project or send a message to restart.');
+                }
+            });
+        } catch (e: any) {
+            await ctx.reply(`❌ Failed: ${e.message}`);
+        }
     });
 
     // /autoaccept command
@@ -1172,22 +1247,57 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
     // Note: any active ResponseMonitor polling the closed workspace will encounter
     // errors until it times out, since the monitor is not pool-managed.
     bot.command('close', async (ctx) => {
-        const ch = getChannel(ctx);
-        const resolved = await resolveWorkspaceAndCdp(ch);
-        const cdp = (resolved.ok ? resolved.cdp : null) ?? getCurrentCdp(bridge);
-        if (!cdp) {
-            await ctx.reply('⚠️ No active Antigravity session to close.');
+        const requestedProject = (ctx.match || '').trim();
+        let projectName: string | null = null;
+
+        // 1. Specific project requested via command (e.g., /close another)
+        if (requestedProject) {
+            projectName = requestedProject;
+            if (!bridge.pool.getConnected(projectName)) {
+                await ctx.reply(`⚠️ Project "<b>${escapeHtml(projectName)}</b>" is not currently open.`, { parse_mode: 'HTML' });
+                return;
+            }
+        }
+
+        // 2. If no project specified, find all active ones
+        const active = bridge.pool.getActiveWorkspaceNames();
+        if (active.length === 0) {
+            await ctx.reply('⚠️ No active Antigravity sessions found.');
             return;
         }
-        const projectName = (resolved.ok ? resolved.projectName : null) ?? cdp.getCurrentWorkspaceName();
+
+        // 3. If multiple projects open or we need selection, show keyboard
+        if (!projectName && active.length > 1) {
+            const keyboard = new InlineKeyboard();
+            for (const name of active) {
+                keyboard.text(`🛑 Close: ${name}`, `${CLOSE_PROJECT_PREFIX}${name}`).row();
+            }
+            keyboard.text('❌ Cancel', 'close_cancel');
+
+            await replyHtml(ctx, `<b>🛑 Close Project</b>\nSelect which Antigravity workspace to terminate:`, keyboard);
+            return;
+        }
+
+        // 4. Fallback: close the only active one or the one bound to chat
         if (!projectName) {
-            await ctx.reply('⚠️ No active project bound to this chat. Cannot close.');
+            if (active.length === 1) {
+                projectName = active[0];
+            } else {
+                const ch = getChannel(ctx);
+                const resolved = await resolveWorkspaceAndCdp(ch);
+                projectName = (resolved.ok ? resolved.projectName : null) ?? getCurrentCdp(bridge)?.getCurrentWorkspaceName() ?? null;
+            }
+        }
+
+        if (!projectName) {
+            await ctx.reply('⚠️ Could not identify which project to close. Try /close [name]');
             return;
         }
+
         try {
             await replyHtml(ctx, `🛑 Closing Antigravity workspace: <code>${escapeHtml(projectName)}</code>…`);
             await bridge.pool.closeBrowserWorkspace(projectName);
-            await ctx.reply('✅ Workspace closed. Send a new prompt or use /project to reconnect.');
+            await ctx.reply(`✅ Workspace <b>${escapeHtml(projectName)}</b> closed.`, { parse_mode: 'HTML' });
         } catch (e: any) {
             await ctx.reply(`❌ Error closing workspace: ${e.message}`);
         }
@@ -1410,6 +1520,26 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             return;
         }
 
+        // Project close selection
+        if (data.startsWith(CLOSE_PROJECT_PREFIX)) {
+            const projectName = data.replace(CLOSE_PROJECT_PREFIX, '');
+            await ctx.answerCallbackQuery({ text: `Closing ${projectName}...` });
+            try {
+                await ctx.editMessageText(`🛑 Closing Antigravity workspace: <code>${escapeHtml(projectName)}</code>…`, { parse_mode: 'HTML' });
+                await bridge.pool.closeBrowserWorkspace(projectName);
+                await ctx.editMessageText(`✅ Workspace <b>${escapeHtml(projectName)}</b> closed.`, { parse_mode: 'HTML' });
+            } catch (e: any) {
+                await ctx.reply(`❌ Error closing workspace: ${e.message}`);
+            }
+            return;
+        }
+
+        if (data === 'close_cancel') {
+            await ctx.editMessageText('❌ Close operation cancelled.');
+            await ctx.answerCallbackQuery();
+            return;
+        }
+
         // Project selection
         if (data.startsWith(`${PROJECT_SELECT_ID}:`)) {
             const workspacePath = data.replace(`${PROJECT_SELECT_ID}:`, '');
@@ -1461,9 +1591,23 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
 
             const fullPath = workspaceService.getWorkspacePath(workspacePath);
             await ctx.editMessageText(
-                `<b>📁 Project Selected</b>\n\n✅ <b>${escapeHtml(workspacePath)}</b>\n<code>${escapeHtml(fullPath)}</code>\n\nSend messages here to interact with this project.`,
+                `<b>📁 Project Selected</b>\n\n✅ <b>${escapeHtml(workspacePath)}</b>\n<code>${escapeHtml(fullPath)}</code>\n\n⏳ Connecting to Antigravity and applying resource limits…`,
                 { parse_mode: 'HTML' },
             );
+
+            // Connect immediately to ensure old instances are closed BEFORE the user sends a message.
+            bridge.pool.getOrConnect(fullPath).then(() => {
+                ctx.editMessageText(
+                    `<b>📁 Project Selected</b>\n\n✅ <b>${escapeHtml(workspacePath)}</b>\n<code>${escapeHtml(fullPath)}</code>\n\nReady! Send messages here to interact with this project.`,
+                    { parse_mode: 'HTML' },
+                ).catch(() => {});
+            }).catch((e: any) => {
+                ctx.editMessageText(
+                    `<b>📁 Project Selected</b>\n\n✅ <b>${escapeHtml(workspacePath)}</b>\n<code>${escapeHtml(fullPath)}</code>\n\n⚠️ <b>Connection Failed:</b> ${escapeHtml(e.message)}\n\nSend a message to retry.`,
+                    { parse_mode: 'HTML' },
+                ).catch(() => {});
+            });
+
             await ctx.answerCallbackQuery({ text: `Selected: ${workspacePath}` });
             return;
         }
@@ -2185,10 +2329,11 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
                     { command: 'allow_chat', description: 'Always-allow pending IDE confirmation dialog' },
                     { command: 'deny', description: 'Deny pending IDE confirmation dialog' },
                     { command: 'autoaccept', description: 'Toggle auto-approve mode' },
+                    { command: 'max', description: 'Set maximum number of open projects' },
+                    { command: 'system_kill', description: 'Force kill all Antigravity processes (Reset)' },
                     { command: 'status', description: 'Bot status overview' },
                     { command: 'ping', description: 'Check latency' },
-                ]);
-                logger.info('Telegram command menu registered successfully');
+                    ]);                logger.info('Telegram command menu registered successfully');
             } catch (err) {
                 logger.error('Failed to register command menu:', err);
             }

@@ -185,8 +185,8 @@ export function parseErrorPopupCustomId(customId: string): { action: 'dismiss' |
     return null;
 }
 
-export function initCdpBridge(autoApproveDefault: boolean): CdpBridge {
-    const pool = new CdpConnectionPool({
+export function initCdpBridge(autoApproveDefault: boolean, maxOpenProjects: number = 3): CdpBridge {
+    const pool = new CdpConnectionPool(maxOpenProjects, {
         cdpCallTimeout: 15000,
         maxReconnectAttempts: 3,
         reconnectDelayMs: 3000,
